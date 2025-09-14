@@ -92,6 +92,9 @@ function create() {
   terraforming = new Terraforming(resources, celestialParameters);
   terraforming.initializeTerraforming();
 
+  // Initialize the planet visualizer (requires resources and terraforming)
+  initializePlanetVisualizerUI();
+
   goldenAsteroid = new GoldenAsteroid();
 
   solisManager = new SolisManager();

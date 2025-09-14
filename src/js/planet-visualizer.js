@@ -22,6 +22,8 @@
       this.sphere = null;
       this.sunLight = null;
       this.sunMesh = null;
+      this.atmoMesh = null;
+      this.atmoMaterial = null;
       this.cityLightsGroup = null;
       this.cityLights = [];
       this.maxCityLights = 200; // Total available city lights
@@ -108,6 +110,11 @@
       // Pre-create a pool of tiny city lights attached to the planet
       this.createCityLights();
 
+      // Atmosphere shell (single scattering approximation)
+      this.createAtmosphere();
+      // Cloud sphere (shader-based procedural)
+      this.createCloudSphere();
+
       window.addEventListener('resize', this.onResize);
 
       if (this.debug.enabled) {
@@ -120,6 +127,8 @@
       this.updateSurfaceTextureFromPressure(true);
       // Ensure lights match initial population
       this.updateCityLights();
+      // Initialize cloud uniforms from current coverage
+      this.updateCloudUniforms();
       this.animate();
     }
 
@@ -165,6 +174,10 @@
       this.updateSurfaceTextureFromPressure();
       // Adjust city lights based on population
       this.updateCityLights();
+      // Update atmosphere uniforms (pressure, sun dir, tint)
+      this.updateAtmosphereUniforms();
+      // Update cloud shader uniforms (no relative rotation)
+      this.updateCloudUniforms();
 
       this.renderer.render(this.scene, this.camera);
       requestAnimationFrame(this.animate);
@@ -241,6 +254,7 @@
       // Coverage sliders (percent)
       makeRow('waterCov', 'Water (%)', 0, 100, 0.1);
       makeRow('lifeCov',  'Life (%)',  0, 100, 0.1);
+      makeRow('cloudCov', 'Clouds (%)', 0, 100, 0.1);
 
       const controls = document.createElement('div');
       controls.className = 'pv-controls';
@@ -266,6 +280,7 @@
       setVal('inert', Number(r.inert.range.value));
       setVal('h2o',   Number(r.h2o.range.value));
       setVal('ch4',   Number(r.ch4.range.value));
+      setVal('cloudCov', Number(r.cloudCov?.range?.value || 0));
       setVal('waterCov', Number(r.waterCov.range.value));
       setVal('lifeCov',  Number(r.lifeCov.range.value));
     }
@@ -297,6 +312,206 @@
       }
     }
 
+    // ---------- Atmosphere ----------
+    createAtmosphere() {
+      const atmoRadius = 1.03; // slightly larger than planet
+      const geo = new THREE.SphereGeometry(atmoRadius, 48, 32);
+      const uniforms = {
+        sunDir: { value: new THREE.Vector3(1, 0, 0) },
+        cameraPos: { value: new THREE.Vector3() },
+        rayleigh: { value: 1.0 },
+        mie: { value: 0.02 },
+        mieG: { value: 0.76 },
+        pRatio: { value: 0.0 }, // 0..1 pressure ratio (kPa/100)
+        tint: { value: new THREE.Color(0x6fa8ff) },
+      };
+      const vtx = `
+        varying vec3 vWorldPos;
+        void main() {
+          vec4 wp = modelMatrix * vec4(position, 1.0);
+          vWorldPos = wp.xyz;
+          gl_Position = projectionMatrix * viewMatrix * wp;
+        }
+      `;
+      const frag = `
+        precision mediump float;
+        varying vec3 vWorldPos;
+        uniform vec3 sunDir;
+        uniform vec3 cameraPos;
+        uniform float rayleigh;
+        uniform float mie;
+        uniform float mieG;
+        uniform float pRatio;
+        uniform vec3 tint;
+
+        const float PI = 3.14159265359;
+
+        float rayleighPhase(float cosTheta){
+          return 3.0/(16.0*PI) * (1.0 + cosTheta*cosTheta);
+        }
+        float hgPhase(float cosTheta, float g){
+          float g2 = g*g;
+          return 3.0/(8.0*PI) * (1.0 - g2) * (1.0 + cosTheta*cosTheta) / pow(1.0 + g2 - 2.0*g*cosTheta, 1.5);
+        }
+
+        void main(){
+          // Normal from planet center (assumes planet at origin)
+          vec3 N = normalize(vWorldPos);
+          vec3 V = normalize(cameraPos - vWorldPos);
+          float mu = clamp(dot(N, normalize(sunDir)), -1.0, 1.0); // sun zenith
+          float cosTheta = clamp(dot(V, normalize(sunDir)), -1.0, 1.0);
+
+          // Simple height/edge factor to enhance limb
+          float viewN = clamp(1.0 - dot(N, V), 0.0, 1.0);
+
+          float Fr = rayleighPhase(mu);
+          float Fm = hgPhase(mu, mieG);
+
+          // Day-side only contribution
+          float day = max(0.0, mu);
+
+          // Pressure scaling
+          float pr = clamp(pRatio, 0.0, 1.2);
+
+          vec3 col = tint * (rayleigh * Fr * 0.9 + mie * Fm * 0.1);
+          col *= day * viewN * (0.15 + 1.35 * pr);
+
+          gl_FragColor = vec4(col, clamp(0.02 + 0.98*pr, 0.0, 1.0));
+        }
+      `;
+      this.atmoMaterial = new THREE.ShaderMaterial({
+        vertexShader: vtx,
+        fragmentShader: frag,
+        uniforms,
+        side: THREE.BackSide,
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      });
+      this.atmoMesh = new THREE.Mesh(geo, this.atmoMaterial);
+      this.scene.add(this.atmoMesh);
+    }
+
+  updateAtmosphereUniforms() {
+      if (!this.atmoMaterial) return;
+      // Pressure ratio from kPa (visualizer when debug enabled)
+      const kPa = this.computeTotalPressureKPa();
+      const pr = Math.max(0, Math.min(1, kPa / 100));
+      const u = this.atmoMaterial.uniforms;
+      u.pRatio.value = pr;
+      // Tie strengths to pressure
+      u.rayleigh.value = 1.0 * (0.2 + 0.8 * pr);
+      u.mie.value = 0.02 * (0.1 + 0.9 * pr);
+      // Sun direction
+      const dir = this.sunLight ? this.sunLight.position.clone().normalize() : new THREE.Vector3(1,0,0);
+      u.sunDir.value.copy(dir);
+      // Camera position
+      u.cameraPos.value.copy(this.camera.position);
+      // Tint from water coverage (more blue with water)
+      const water = (this.viz.coverage?.water || 0) / 100;
+      const base = new THREE.Color(0x7aa6ff); // blue
+      const dry = new THREE.Color(0xd7a37a);  // dry dusty
+      const mix = dry.clone().lerp(base, water);
+      u.tint.value.copy(mix);
+    }
+
+    // --- Cloud sphere helpers ---
+    createCloudSphere() {
+      const cloudRadius = 1.022; // between planet and atmosphere
+      const geo = new THREE.SphereGeometry(cloudRadius, 48, 32);
+      const seed = this.hashSeedFromPlanet();
+      const uniforms = {
+        sunDir: { value: new THREE.Vector3(1,0,0) },
+        time: { value: 0 },
+        coverage: { value: 0.5 },
+        baseScale: { value: 2.5 },
+        warpScale: { value: 0.8 },
+        flow: { value: 0.03 },
+        seed: { value: new THREE.Vector2(seed.x, seed.y) },
+      };
+      const vtx = `
+        precision highp float;
+        varying vec3 vWorldPos; varying vec3 vNormal;
+        void main(){
+          vec4 wp = modelMatrix * vec4(position,1.0);
+          vWorldPos = wp.xyz; vNormal = normalize(normalMatrix * normal);
+          gl_Position = projectionMatrix * viewMatrix * wp;
+        }
+      `;
+      const frag = `
+        precision highp float; varying vec3 vWorldPos; varying vec3 vNormal;
+        uniform vec3 sunDir; uniform float time; uniform float coverage; uniform vec2 seed; uniform float baseScale; uniform float warpScale; uniform float flow;
+        const float PI = 3.14159265359;
+        float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7))) * 43758.5453123); }
+        float noise(in vec2 p){ vec2 i=floor(p), f=fract(p); vec2 u=f*f*(3.0-2.0*f); float a=hash(i); float b=hash(i+vec2(1,0)); float c=hash(i+vec2(0,1)); float d=hash(i+vec2(1,1)); return mix(mix(a,b,u.x), mix(c,d,u.x), u.y); }
+        float fbm(vec2 p){ float v=0.0; float a=0.5; for(int i=0;i<5;i++){ v+=a*noise(p); p*=2.0; a*=0.5; } return v; }
+        void main(){
+          vec3 N = normalize(vWorldPos);
+          // Equirectangular UV
+          float u = atan(N.z, N.x)/(2.0*PI) + 0.5; float v = acos(N.y)/PI;
+          vec2 uv = vec2(u,v);
+          // No longitudinal advection; morph shapes slowly via time-based domain warp
+          float lat = asin(N.y);
+          vec2 q = uv*baseScale + seed;
+          vec2 morph = vec2(cos(time), sin(time)) * 0.1;
+          vec2 warp = vec2(fbm(q + 3.1*seed), fbm(q + 5.7*seed));
+          float n = fbm(q + warp*warpScale + morph);
+          // Soft threshold for puffs
+          float d = smoothstep(0.55, 0.75, n);
+          // Day-side lighting
+          float day = clamp(dot(N, normalize(sunDir))*0.7 + 0.3, 0.0, 1.0);
+          float a = d * clamp(coverage,0.0,1.0) * day;
+          if (a <= 0.001) discard;
+          gl_FragColor = vec4(vec3(1.0), a);
+        }
+      `;
+      this.cloudMaterial = new THREE.ShaderMaterial({
+        vertexShader: vtx,
+        fragmentShader: frag,
+        uniforms,
+        transparent: true,
+        depthWrite: false,
+      });
+      this.cloudMesh = new THREE.Mesh(geo, this.cloudMaterial);
+      // Attach to sphere so clouds rotate with planet; local rotation adds drift
+      this.sphere.add(this.cloudMesh);
+    }
+
+    generateCloudCanvas() {
+      const w = 1024, h = 512;
+      const canvas = document.createElement('canvas');
+      canvas.width = w; canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0,0,w,h);
+      const blobs = 900;
+      for (let i = 0; i < blobs; i++) {
+        const x = Math.random() * w;
+        const y = Math.random() * h;
+        const r = 8 + Math.random() * 40;
+        const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+        const a = 0.15 + Math.random() * 0.15;
+        g.addColorStop(0, `rgba(255,255,255,${a.toFixed(3)})`);
+        g.addColorStop(1, 'rgba(255,255,255,0)');
+        ctx.fillStyle = g;
+        ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI*2); ctx.fill();
+      }
+      return canvas;
+    }
+
+    updateCloudTexture(force = false) {
+      if (!this.cloudMesh || !this.cloudMaterial) return;
+      const cov = Math.max(0, Math.min(1, (this.viz.coverage?.cloud || 0) / 100));
+      // Generate the cloud map once and then keep it stable; only opacity changes
+      if (!this.cloudMaterial.map) {
+        const canvas = this.generateCloudCanvas();
+        const tex = new THREE.CanvasTexture(canvas);
+        tex.wrapS = THREE.RepeatWrapping;
+        tex.wrapT = THREE.ClampToEdgeWrapping;
+        this.cloudMaterial.map = tex;
+        this.cloudMaterial.needsUpdate = true;
+      }
+      this.cloudMaterial.opacity = 0.2 + 0.8 * cov;
+    }
     getCurrentPopulation() {
       if (this.debug.enabled) {
         return this.viz.pop || 0;
@@ -326,6 +541,31 @@
         const daySide = tmp.dot(sunDir) > 0; // facing the sun
         m.visible = !daySide; // lights only on the night side
       }
+    }
+
+    hashSeedFromPlanet(){
+      const name = (currentPlanetParameters && currentPlanetParameters.name) || 'Planet';
+      let h = 2166136261>>>0; for(let i=0;i<name.length;i++){ h ^= name.charCodeAt(i); h = Math.imul(h, 16777619); }
+      const x = ((h & 0xffff) / 65535);
+      const y = (((h>>>16) & 0xffff) / 65535);
+      return { x, y };
+    }
+
+    updateCloudUniforms(){
+      if (!this.cloudMaterial || !this.cloudMaterial.uniforms) return;
+      const cov = Math.max(0, Math.min(1, (this.viz.coverage?.cloud || 0)/100));
+      this.cloudMaterial.uniforms.coverage.value = cov;
+      // Morph time: one full cycle every ~2.5 in-game days
+      let t = 0.0;
+      if (typeof dayNightCycle !== 'undefined' && dayNightCycle && typeof dayNightCycle.dayDuration === 'number') {
+        const daysElapsed = (dayNightCycle.elapsedTime || 0) / Math.max(1, dayNightCycle.dayDuration);
+        t = (daysElapsed / 2.5) * (Math.PI * 2.0);
+      } else {
+        t = (performance.now() / 1000 / 60 / 2.5) * (Math.PI * 2.0);
+      }
+      this.cloudMaterial.uniforms.time.value = t;
+      const dir = this.sunLight ? this.sunLight.position.clone().normalize() : new THREE.Vector3(1,0,0);
+      this.cloudMaterial.uniforms.sunDir.value.copy(dir);
     }
 
     // Convert pressure (kPa) -> mass (tons) using same physics as pressure calc
@@ -370,9 +610,12 @@
       // Coverage sliders (visual only)
       this.viz.coverage.water = clampFrom(r.waterCov);
       this.viz.coverage.life  = clampFrom(r.lifeCov);
+      if (r.cloudCov) this.viz.coverage.cloud = clampFrom(r.cloudCov);
 
       // Surface should reflect pressure immediately
       this.updateSurfaceTextureFromPressure(true);
+      // Refresh cloud uniforms immediately
+      this.updateCloudUniforms();
     }
 
     // Read game state and set sliders accordingly
@@ -412,6 +655,11 @@
       r.waterCov.number.value = r.waterCov.range.value;
       r.lifeCov.range.value = String((lifeFrac * 100).toFixed(2));
       r.lifeCov.number.value = r.lifeCov.range.value;
+      // Set clouds initially equal to water (user can change)
+      if (r.cloudCov) {
+        r.cloudCov.range.value = r.waterCov.range.value;
+        r.cloudCov.number.value = r.cloudCov.range.value;
+      }
       
       this.updateSliderValueLabels();
       // Update visualizer-local state and visuals (no game mutation)
@@ -427,9 +675,11 @@
       this.viz.coverage = {
         water: Number(r.waterCov.range.value),
         life: Number(r.lifeCov.range.value),
+        cloud: Number(r.cloudCov ? r.cloudCov.range.value : r.waterCov.range.value),
       };
       if (this.sunLight) this.sunLight.intensity = this.viz.illum;
       this.updateSurfaceTextureFromPressure(true);
+      this.updateCloudUniforms();
     }
 
     // ---------- Crater texture generation ----------

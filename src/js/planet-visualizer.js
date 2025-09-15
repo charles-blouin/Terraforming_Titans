@@ -75,7 +75,8 @@
         illum: 1,
         pop: 0,
         kpa: { co2: 0, o2: 0, inert: 0, h2o: 0, ch4: 0 },
-        coverage: { water: 0, life: 0 },
+        coverage: { water: 0, life: 0, cloud: 0 },
+        inclinationDeg: 15,
       };
     }
 
@@ -116,6 +117,8 @@
       this.sunMesh = new THREE.Mesh(sunGeom, sunMat);
       this.sunMesh.position.copy(this.sunLight.position).multiplyScalar(1.6);
       this.scene.add(this.sunMesh);
+      // Apply current inclination setting to sun position
+      this.updateSunFromInclination();
 
       const geometry = new THREE.SphereGeometry(1, 32, 32);
       const material = new THREE.MeshStandardMaterial({ color: 0xaa2222 });
@@ -265,6 +268,8 @@
 
       // Illumination (star luminosity multiplier)
       makeRow('illum', 'Illumination', 0.0, 3.0, 0.01);
+      // Planet inclination (sun elevation)
+      makeRow('incl', 'Inclination (deg)', -90, 90, 1);
       // Population (colonists)
       makeRow('pop', 'Population', 0, 1000000, 1);
       // Spaceship visualizer count
@@ -300,6 +305,7 @@
       const setVal = (id, v) => { if (r[id]) r[id].number.value = String(v); if (r[id]) r[id].range.value = String(v); };
       setVal('illum', Number(r.illum.range.value));
       setVal('pop',   Number(r.pop.range.value));
+      if (r.incl) setVal('incl',  Number(r.incl.range.value));
       setVal('ships', Number(r.ships.range.value));
       setVal('co2',   Number(r.co2.range.value));
       setVal('o2',    Number(r.o2.range.value));
@@ -439,6 +445,21 @@
       const dry = new THREE.Color(0xd7a37a);  // dry dusty
       const mix = dry.clone().lerp(base, water);
       u.tint.value.copy(mix);
+    }
+
+    // Update sun (directional light and marker) based on inclination angle in degrees
+    updateSunFromInclination() {
+      if (!this.sunLight) return;
+      const deg = (this.viz?.inclinationDeg ?? 15);
+      const elev = deg * Math.PI / 180; // elevation from equator
+      // Keep fixed azimuth based on initial xz ratio (5:2)
+      const az = Math.atan2(2, 5);
+      const r = 6.0; // visual distance
+      const x = r * Math.cos(elev) * Math.cos(az);
+      const y = r * Math.sin(elev);
+      const z = r * Math.cos(elev) * Math.sin(az);
+      this.sunLight.position.set(x, y, z);
+      if (this.sunMesh) this.sunMesh.position.copy(this.sunLight.position).multiplyScalar(1.6);
     }
 
     // --- Cloud sphere helpers ---
@@ -876,6 +897,11 @@
       // Illumination (visualizer only)
       const illum = clampFrom(r.illum);
       this.viz.illum = illum;
+      // Inclination (degrees)
+      if (r.incl) {
+        this.viz.inclinationDeg = clampFrom(r.incl);
+        this.updateSunFromInclination();
+      }
       if (this.sunLight) this.sunLight.intensity = illum;
 
       // Population (visualizer only)
@@ -912,6 +938,12 @@
       const illum = cel.starLuminosity ?? 1;
       r.illum.range.value = String(illum);
       r.illum.number.value = String(illum);
+      // Inclination sync from local viz (default 15 deg)
+      if (r.incl) {
+        const inc = (this.viz?.inclinationDeg ?? 15);
+        r.incl.range.value = String(inc);
+        r.incl.number.value = String(inc);
+      }
       // Population
       const popNow = this.resources.colony.colonists.value || 0;
       r.pop.range.value = String(popNow);
@@ -1183,3 +1215,4 @@
     window.planetVisualizer.init();
   };
 })();
+

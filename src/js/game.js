@@ -93,7 +93,11 @@ function create() {
   terraforming.initializeTerraforming();
 
   // Initialize the planet visualizer (requires resources and terraforming)
-  initializePlanetVisualizerUI();
+  if (typeof initializePlanetVisualizerUI === 'function') {
+    initializePlanetVisualizerUI();
+  } else {
+    console.warn('Planet visualizer not available: initializePlanetVisualizerUI not defined');
+  }
 
   goldenAsteroid = new GoldenAsteroid();
 

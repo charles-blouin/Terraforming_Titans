@@ -159,6 +159,10 @@
       if (this.sphere) {
         this.sphere.rotation.y = angle;
       }
+      // Ensure cloud shell matches planet rotation exactly
+      if (this.cloudMesh) {
+        this.cloudMesh.rotation.y = angle;
+      }
       // Camera follows the same angular position (geostationary)
       const ang = angle;
       this.camera.position.set(
@@ -431,27 +435,30 @@
       };
       const vtx = `
         precision highp float;
-        varying vec3 vWorldPos; varying vec3 vNormal;
+        varying vec3 vWorldPos; varying vec3 vWorldDir; varying vec3 vObjDir;
         void main(){
           vec4 wp = modelMatrix * vec4(position,1.0);
-          vWorldPos = wp.xyz; vNormal = normalize(normalMatrix * normal);
+          vWorldPos = wp.xyz;
+          vWorldDir = normalize(wp.xyz);
+          vObjDir = normalize(position);
           gl_Position = projectionMatrix * viewMatrix * wp;
         }
       `;
       const frag = `
-        precision highp float; varying vec3 vWorldPos; varying vec3 vNormal;
+        precision highp float; varying vec3 vWorldPos; varying vec3 vWorldDir; varying vec3 vObjDir;
         uniform vec3 sunDir; uniform float time; uniform float coverage; uniform vec2 seed; uniform float baseScale; uniform float warpScale; uniform float flow;
         const float PI = 3.14159265359;
         float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7))) * 43758.5453123); }
         float noise(in vec2 p){ vec2 i=floor(p), f=fract(p); vec2 u=f*f*(3.0-2.0*f); float a=hash(i); float b=hash(i+vec2(1,0)); float c=hash(i+vec2(0,1)); float d=hash(i+vec2(1,1)); return mix(mix(a,b,u.x), mix(c,d,u.x), u.y); }
         float fbm(vec2 p){ float v=0.0; float a=0.5; for(int i=0;i<5;i++){ v+=a*noise(p); p*=2.0; a*=0.5; } return v; }
         void main(){
-          vec3 N = normalize(vWorldPos);
-          // Equirectangular UV
-          float u = atan(N.z, N.x)/(2.0*PI) + 0.5; float v = acos(N.y)/PI;
+          vec3 Nworld = normalize(vWorldDir);
+          vec3 Nobj = normalize(vObjDir);
+          // Equirectangular UV from object space so pattern rotates with planet
+          float u = atan(Nobj.z, Nobj.x)/(2.0*PI) + 0.5; float v = acos(Nobj.y)/PI;
           vec2 uv = vec2(u,v);
           // No longitudinal advection; morph shapes slowly via time-based domain warp
-          float lat = asin(N.y);
+          float lat = asin(Nobj.y);
           vec2 q = uv*baseScale + seed;
           vec2 morph = vec2(cos(time), sin(time)) * 0.1;
           vec2 warp = vec2(fbm(q + 3.1*seed), fbm(q + 5.7*seed));
@@ -459,7 +466,7 @@
           // Soft threshold for puffs
           float d = smoothstep(0.55, 0.75, n);
           // Day-side lighting
-          float day = clamp(dot(N, normalize(sunDir))*0.7 + 0.3, 0.0, 1.0);
+          float day = clamp(dot(Nworld, normalize(sunDir))*0.7 + 0.3, 0.0, 1.0);
           float a = d * clamp(coverage,0.0,1.0) * day;
           if (a <= 0.001) discard;
           gl_FragColor = vec4(vec3(1.0), a);
@@ -473,8 +480,8 @@
         depthWrite: false,
       });
       this.cloudMesh = new THREE.Mesh(geo, this.cloudMaterial);
-      // Attach to sphere so clouds rotate with planet; local rotation adds drift
-      this.sphere.add(this.cloudMesh);
+      // Keep as separate node; we will explicitly sync its rotation to the planet each frame
+      this.scene.add(this.cloudMesh);
     }
 
     generateCloudCanvas() {

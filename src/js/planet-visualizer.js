@@ -24,10 +24,22 @@
       this.sunMesh = null;
       this.atmoMesh = null;
       this.atmoMaterial = null;
+      this.starField = null;
       this.cityLightsGroup = null;
       this.cityLights = [];
       this.maxCityLights = 200; // Total available city lights
       this.lastCityLightCount = -1;
+      // Ships (points + line trails)
+      this.shipCapacity = 1000;
+      this.shipStates = [];
+      this.shipHeads = null;
+      this.shipTrails = null;
+      this.shipHeadPositions = null;
+      this.shipTrailPositions = null;
+      this.shipTrailColors = null;
+      this._lastAnimTime = performance.now();
+      this._spawnAcc = 0; // accumulator for continuous spawning
+      this._spawnRate = 6; // ships per second when below target
 
       // Render sizing
       this.width = 0;
@@ -85,6 +97,8 @@
       container.appendChild(this.renderer.domElement);
 
       this.scene = new THREE.Scene();
+      // Faint background stars
+      this.createStarField();
       this.camera = new THREE.PerspectiveCamera(45, this.width / this.height, 0.1, 1000);
       this.camera.position.z = this.cameraDistance;
       this.camera.position.y = this.cameraHeight;
@@ -115,6 +129,8 @@
       this.createAtmosphere();
       // Cloud sphere (shader-based procedural)
       this.createCloudSphere();
+      // Spaceship particles
+      this.createShipSystem();
 
       window.addEventListener('resize', this.onResize);
 
@@ -183,6 +199,8 @@
       this.updateAtmosphereUniforms();
       // Update cloud shader uniforms (no relative rotation)
       this.updateCloudUniforms();
+      // Update ships
+      this.updateShips();
 
       this.renderer.render(this.scene, this.camera);
       requestAnimationFrame(this.animate);
@@ -249,6 +267,8 @@
       makeRow('illum', 'Illumination', 0.0, 3.0, 0.01);
       // Population (colonists)
       makeRow('pop', 'Population', 0, 1000000, 1);
+      // Spaceship visualizer count
+      makeRow('ships', 'Spaceships', 0, 1000, 1);
       // Gas pressures (kPa) – clamped to 0..100
       makeRow('co2', 'CO2 (kPa)', 0, 100, 0.1);
       makeRow('o2',  'O2 (kPa)',  0, 100, 0.1);
@@ -280,6 +300,7 @@
       const setVal = (id, v) => { if (r[id]) r[id].number.value = String(v); if (r[id]) r[id].range.value = String(v); };
       setVal('illum', Number(r.illum.range.value));
       setVal('pop',   Number(r.pop.range.value));
+      setVal('ships', Number(r.ships.range.value));
       setVal('co2',   Number(r.co2.range.value));
       setVal('o2',    Number(r.o2.range.value));
       setVal('inert', Number(r.inert.range.value));
@@ -421,6 +442,33 @@
     }
 
     // --- Cloud sphere helpers ---
+    createStarField() {
+      const starCount = 1200;
+      const radius = 60;
+      const positions = new Float32Array(starCount * 3);
+      for (let i = 0; i < starCount; i++) {
+        const u = Math.random();
+        const v = Math.random();
+        const theta = 2 * Math.PI * u;
+        const phi = Math.acos(2 * v - 1);
+        positions[i * 3 + 0] = radius * Math.sin(phi) * Math.cos(theta);
+        positions[i * 3 + 1] = radius * Math.cos(phi);
+        positions[i * 3 + 2] = radius * Math.sin(phi) * Math.sin(theta);
+      }
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      const material = new THREE.PointsMaterial({
+        color: 0xffffff,
+        size: 0.3,
+        transparent: true,
+        opacity: 0.35,
+        depthWrite: false,
+        sizeAttenuation: true,
+      });
+      this.starField = new THREE.Points(geometry, material);
+      this.starField.renderOrder = -10;
+      this.scene.add(this.starField);
+    }
     createCloudSphere() {
       const cloudRadius = 1.022; // between planet and atmosphere
       const geo = new THREE.SphereGeometry(cloudRadius, 48, 32);
@@ -483,6 +531,185 @@
       this.cloudMesh = new THREE.Mesh(geo, this.cloudMaterial);
       // Keep as separate node; we will explicitly sync its rotation to the planet each frame
       this.scene.add(this.cloudMesh);
+    }
+
+    // ---------- Spaceship particle system ----------
+    createShipSystem() {
+      const cap = this.shipCapacity;
+      // Heads (points)
+      this.shipHeadPositions = new Float32Array(cap * 3);
+      const headGeo = new THREE.BufferGeometry();
+      headGeo.setAttribute('position', new THREE.BufferAttribute(this.shipHeadPositions, 3));
+      const headMat = new THREE.PointsMaterial({ color: 0xffffff, size: 0.03, sizeAttenuation: true, transparent: true, opacity: 1, depthWrite: false });
+      this.shipHeads = new THREE.Points(headGeo, headMat);
+      this.scene.add(this.shipHeads);
+
+      // Trails (line segments)
+      this.shipTrailPositions = new Float32Array(cap * 2 * 3);
+      this.shipTrailColors = new Float32Array(cap * 2 * 3);
+      const trailGeo = new THREE.BufferGeometry();
+      trailGeo.setAttribute('position', new THREE.BufferAttribute(this.shipTrailPositions, 3));
+      trailGeo.setAttribute('color', new THREE.BufferAttribute(this.shipTrailColors, 3));
+      const trailMat = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.9, depthWrite: false });
+      this.shipTrails = new THREE.LineSegments(trailGeo, trailMat);
+      this.scene.add(this.shipTrails);
+    }
+
+    spawnShip() {
+      // Start near equator with random longitude; choose an orbit inclination up to ±15° for some ships
+      const lon = Math.random() * Math.PI * 2;
+      const inc = (Math.random() < 0.35 ? (Math.random() * 2 - 1) * (Math.PI / 12) : 0); // up to ±15°
+      const node = Math.random() * Math.PI * 2; // ascending node
+      const axis = new THREE.Vector3(Math.cos(node), 0, Math.sin(node));
+      const r0 = 1.005;
+      // Base equatorial position then incline progressively during launch
+      const base = new THREE.Vector3(Math.cos(lon) * r0, 0, Math.sin(lon) * r0);
+      const q = new THREE.Quaternion().setFromAxisAngle(axis, inc * 0.0);
+      const pos = base.clone().applyQuaternion(q);
+      const eastEq = new THREE.Vector3(-Math.sin(lon), 0, Math.cos(lon)).normalize();
+      const east = eastEq.clone().applyQuaternion(q);
+      const normal = pos.clone().normalize();
+      const vel = east.clone().multiplyScalar(-0.015).add(normal.clone().multiplyScalar(0.004));
+      this.shipStates.push({
+        phase: 0,
+        t: 0,
+        pos,
+        vel,
+        angle: lon,
+        radius: r0,
+        orbitRadius: 1.04 + Math.random() * 0.03,
+        inc,
+        node,
+        axis,
+        colorHead: new THREE.Color(1.0, 0.75, 0.3),
+        colorTail: new THREE.Color(1.0, 0.55, 0.2),
+        trail: 0.10
+      });
+    }
+
+    sphericalToCartesian(r, lat, lon) {
+      const x = r * Math.cos(lat) * Math.cos(lon);
+      const y = r * Math.sin(lat);
+      const z = r * Math.cos(lat) * Math.sin(lon);
+      return new THREE.Vector3(x, y, z);
+    }
+
+    updateShips() {
+      const now = performance.now();
+      const dt = Math.min(0.05, (now - this._lastAnimTime) / 1000);
+      this._lastAnimTime = now;
+      const target = Math.max(0, Math.min(this.shipCapacity, Math.floor(this.viz?.ships || 0)));
+      // Continuous spawning toward target
+      if (this.shipStates.length < target) {
+        // speed up spawn if far from target
+        const missing = target - this.shipStates.length;
+        const rate = Math.min(20, this._spawnRate + missing * 0.2);
+        this._spawnAcc += rate * dt;
+        while (this._spawnAcc >= 1 && this.shipStates.length < target) {
+          this.spawnShip();
+          this._spawnAcc -= 1;
+        }
+      } else {
+        // if target reduced, trim gradually by forcing oldest to depart fast
+        if (this.shipStates.length > target) {
+          this.shipStates.length = target;
+        }
+        this._spawnAcc = 0;
+      }
+
+      const headPos = this.shipHeadPositions;
+      const trailPos = this.shipTrailPositions;
+      const trailCol = this.shipTrailColors;
+      const K_LAUNCH = 0.22;
+      const OMEGA_L = -3.2; // reversed
+      const OMEGA_O = -1.8; // reversed
+      const ACCEL_D = 0.35;
+      const sunDir = this.sunLight ? this.sunLight.position.clone().normalize() : new THREE.Vector3(1,0,0);
+      const q = new THREE.Quaternion();
+      const basePos = new THREE.Vector3();
+      const baseTan = new THREE.Vector3();
+
+      for (let i = 0; i < this.shipStates.length; i++) {
+        const s = this.shipStates[i];
+        s.t += dt;
+        if (s.phase === 0) {
+          s.radius = s.radius * Math.exp(K_LAUNCH * dt);
+          s.angle += OMEGA_L * dt;
+          // Progressive inclination during launch
+          const prog = Math.min(1, (s.radius - 1.005) / Math.max(0.001, (s.orbitRadius - 1.005)));
+          q.setFromAxisAngle(s.axis, s.inc * prog);
+          basePos.set(Math.cos(s.angle) * s.radius, 0, Math.sin(s.angle) * s.radius);
+          s.pos.copy(basePos).applyQuaternion(q);
+          s.trail = 0.10;
+          s.colorHead.setRGB(1.0, 0.8, 0.3);
+          s.colorTail.setRGB(1.0, 0.6, 0.25);
+          if (s.radius >= s.orbitRadius) { s.phase = 1; s.t = 0; }
+        } else if (s.phase === 1) {
+          s.angle += OMEGA_O * dt;
+          q.setFromAxisAngle(s.axis, s.inc);
+          basePos.set(Math.cos(s.angle) * s.orbitRadius, 0, Math.sin(s.angle) * s.orbitRadius);
+          s.pos.copy(basePos).applyQuaternion(q);
+          s.trail = 0.06;
+          s.colorHead.setRGB(1.0, 1.0, 1.0);
+          s.colorTail.setRGB(0.8, 0.9, 1.0);
+          if (s.t > (2.5 + Math.random() * 2.0)) { s.phase = 2; s.t = 0; s.departSpeed = Math.abs(s.orbitRadius * OMEGA_O); }
+        } else {
+          // Departure: leave tangentially from inclined orbit, then pitch outward
+          q.setFromAxisAngle(s.axis, s.inc);
+          baseTan.set(Math.sin(s.angle), 0, -Math.cos(s.angle)).normalize();
+          const tangent = baseTan.clone().applyQuaternion(q);
+          // Radial outward from planet center
+          const outward = s.pos.clone().normalize();
+          // Blend factor increases over a couple seconds: 0 => pure tangent, 1 => mostly outward
+          const alpha = Math.min(1, s.t / 2.0);
+          const dir = tangent.multiplyScalar(1.0 - 0.2 * alpha) // keep some tangential component
+            .add(outward.multiplyScalar(0.2 + 0.8 * alpha))
+            .normalize();
+          const speed = Math.max(0, s.departSpeed || Math.abs(s.orbitRadius * OMEGA_O));
+          s.pos.addScaledVector(dir, speed * dt);
+          s.trail = (0.10 + 0.22 * Math.min(1, s.t / 3)) / 3; // 3x shorter trails on departure
+          s.colorHead.setRGB(0.9, 0.95, 1.0);
+          s.colorTail.setRGB(0.6, 0.8, 1.0);
+          if (s.pos.length() > 20) { this.shipStates[i] = null; continue; }
+        }
+
+        // Write to buffers
+        const head = s.pos;
+        let trailDir;
+        if (s.phase === 2) {
+          q.setFromAxisAngle(s.axis, s.inc);
+          baseTan.set(Math.sin(s.angle), 0, -Math.cos(s.angle)).normalize();
+          const tangent = baseTan.clone().applyQuaternion(q);
+          const outward = s.pos.clone().normalize();
+          const alpha = Math.min(1, s.t / 2.0);
+          trailDir = tangent.multiplyScalar(1.0 - 0.2 * alpha).add(outward.multiplyScalar(0.2 + 0.8 * alpha)).normalize();
+        } else {
+          q.setFromAxisAngle(s.axis, Math.min(s.inc, s.inc));
+          baseTan.set(Math.sin(s.angle), 0, -Math.cos(s.angle)).normalize();
+          trailDir = baseTan.clone().applyQuaternion(q);
+        }
+        const tail = head.clone().addScaledVector(trailDir, -s.trail);
+        const hp = i * 3;
+        headPos[hp] = head.x; headPos[hp + 1] = head.y; headPos[hp + 2] = head.z;
+        const tp = i * 6;
+        trailPos[tp] = head.x; trailPos[tp + 1] = head.y; trailPos[tp + 2] = head.z;
+        trailPos[tp + 3] = tail.x; trailPos[tp + 4] = tail.y; trailPos[tp + 5] = tail.z;
+        trailCol[tp] = s.colorHead.r; trailCol[tp + 1] = s.colorHead.g; trailCol[tp + 2] = s.colorHead.b;
+        trailCol[tp + 3] = s.colorTail.r * 0.5; trailCol[tp + 4] = s.colorTail.g * 0.5; trailCol[tp + 5] = s.colorTail.b * 0.5;
+      }
+
+      if (this.shipStates.includes(null)) this.shipStates = this.shipStates.filter(Boolean);
+
+      const n = this.shipStates.length;
+      if (this.shipHeads) {
+        this.shipHeads.geometry.setDrawRange(0, n);
+        this.shipHeads.geometry.attributes.position.needsUpdate = true;
+      }
+      if (this.shipTrails) {
+        this.shipTrails.geometry.setDrawRange(0, n * 2);
+        this.shipTrails.geometry.attributes.position.needsUpdate = true;
+        this.shipTrails.geometry.attributes.color.needsUpdate = true;
+      }
     }
 
     generateCloudCanvas() {
@@ -655,6 +882,9 @@
       const pop = Math.max(0, Math.floor(clampFrom(r.pop)));
       this.viz.pop = pop;
 
+      // Spaceships
+      this.viz.ships = Math.max(0, Math.floor(clampFrom(r.ships)));
+
       // Gas pressures (visualizer only, store as kPa)
       this.viz.kpa.co2   = clampFrom(r.co2);
       this.viz.kpa.o2    = clampFrom(r.o2);
@@ -686,6 +916,9 @@
       const popNow = this.resources.colony.colonists.value || 0;
       r.pop.range.value = String(popNow);
       r.pop.number.value = String(popNow);
+      // Spaceships (sync from game if available, otherwise visual state)
+      const shipVal = (this.resources?.special?.spaceships?.value) ?? (this.viz.ships || 0);
+      if (r.ships) { r.ships.range.value = String(shipVal); r.ships.number.value = String(shipVal); }
 
       const toKPa = (massTon) => calculateAtmosphericPressure(massTon || 0, cel.gravity, cel.radius) / 1000;
       const clamp100 = (v) => Math.max(0, Math.min(100, v));
@@ -732,6 +965,7 @@
         life: Number(r.lifeCov.range.value),
         cloud: Number(r.cloudCov ? r.cloudCov.range.value : r.waterCov.range.value),
       };
+      this.viz.ships = Number(r.ships ? r.ships.range.value : 0);
       if (this.sunLight) this.sunLight.intensity = this.viz.illum;
       this.updateSurfaceTextureFromPressure(true);
       this.updateCloudUniforms();

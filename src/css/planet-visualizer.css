@@ -16,15 +16,7 @@
 }
 
 .planet-visualizer-overlay {
-  position: absolute;
-  top: 6px;
-  right: 8px;
-  color: #fff;
-  font-size: 12px;
-  line-height: 1.3;
-  text-align: right;
-  pointer-events: none;
-  text-shadow: 0 1px 2px rgba(0,0,0,0.8);
+  display: none; /* hide debug overlay text */
 }
 
 /* Debug controls under the canvas */
@@ -38,7 +30,7 @@
 
 .pv-grid {
   display: grid;
-  grid-template-columns: 120px 1fr 90px;
+  grid-template-columns: 120px minmax(0, 1fr) 110px;
   gap: 6px 10px;
   align-items: center;
 }
@@ -46,13 +38,30 @@
 .pv-row-label { color: #bbb; }
 .pv-row-value { text-align: right; }
 .pv-row-value input[type="number"] {
-  width: 80px;
+  width: 67%;
+  min-width: 70px;
+  height: 20px;
   padding: 2px 4px;
+  box-sizing: border-box;
   background: #1b1b1b;
-  border: 1px solid #444;
+  border: 1px solid #555;
   color: #eee;
-  border-radius: 2px;
+  border-radius: 3px;
   text-align: right;
+  display: inline-block;
+}
+
+/* Guard against global styles hiding inputs */
+.planet-visualizer-debug input[type="number"] {
+  opacity: 1 !important;
+  visibility: visible !important;
+}
+
+/* Ensure sliders shrink within their grid cell and do not overflow */
+.planet-visualizer-debug input[type="range"] {
+  width: 200%;
+  min-width: 0;
+  box-sizing: border-box;
 }
 .pv-controls { margin-top: 8px; display: flex; gap: 8px; }
 .pv-controls button { font-size: 12px; padding: 3px 6px; }

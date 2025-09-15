@@ -39,6 +39,7 @@
       this.lastCraterFactorKey = null; // memoize texture state
       this.craterLayer = null;    // cached crater alpha/color layer (static shape)
       this.cloudLayer = null;     // cached green cloud layer (static shape)
+      this.waterMask = null;      // cached water mask (grayscale FBM) for oceans
 
       // Bind methods
       this.animate = this.animate.bind(this);
@@ -485,22 +486,69 @@
     }
 
     generateCloudCanvas() {
+      // Persistent, gradually evolving cloud field for the canvas path (fallback/legacy)
+      // Initial random constants are generated once; subsequent calls nudge them slightly.
       const w = 1024, h = 512;
-      const canvas = document.createElement('canvas');
-      canvas.width = w; canvas.height = h;
+      // Init persistent canvas + state once
+      if (!this._cloudCanvas) {
+        this._cloudCanvas = document.createElement('canvas');
+        this._cloudCanvas.width = w;
+        this._cloudCanvas.height = h;
+      }
+      const canvas = this._cloudCanvas;
       const ctx = canvas.getContext('2d');
-      ctx.clearRect(0,0,w,h);
-      const blobs = 900;
-      for (let i = 0; i < blobs; i++) {
-        const x = Math.random() * w;
-        const y = Math.random() * h;
-        const r = 8 + Math.random() * 40;
-        const g = ctx.createRadialGradient(x, y, 0, x, y, r);
-        const a = 0.15 + Math.random() * 0.15;
-        g.addColorStop(0, `rgba(255,255,255,${a.toFixed(3)})`);
+
+      // Initialize blob field with deterministic seed per planet
+      if (!this._cloudBlobState) {
+        const seed = this.hashSeedFromPlanet();
+        // Simple LCG for reproducible randomness
+        let s = Math.floor((seed.x * 65535) ^ (seed.y * 131071)) >>> 0;
+        const rand = () => { s = (1664525 * s + 1013904223) >>> 0; return (s & 0xffffffff) / 0x100000000; };
+        const blobs = 900;
+        const items = [];
+        for (let i = 0; i < blobs; i++) {
+          const x = rand() * w;
+          const y = rand() * h;
+          const r = 8 + rand() * 40;
+          const a = 0.15 + rand() * 0.15;
+          // Tiny velocities so pattern evolves over a few days
+          const dx = (rand() - 0.5) * 5.4;  // pixels per day
+          const dy = (rand() - 0.5) * 2.7;
+          const dr = (rand() - 0.5) * 3;
+          items.push({ x, y, r, a, dx, dy, dr });
+        }
+        this._cloudBlobState = { items, lastDays: 0 };
+      }
+
+      // Compute elapsed in-game days since last draw
+      let days = 0;
+      if (typeof dayNightCycle !== 'undefined' && dayNightCycle && typeof dayNightCycle.dayDuration === 'number') {
+        days = (dayNightCycle.elapsedTime || 0) / Math.max(1, dayNightCycle.dayDuration);
+      } else {
+        days = (performance.now() / 1000) / 60; // ~1 day per minute fallback
+      }
+      const state = this._cloudBlobState;
+      const deltaDays = Math.max(0, Math.min(0.2, days - (state.lastDays || 0))); // clamp to avoid big jumps
+      state.lastDays = days;
+
+      // Evolve field slightly
+      const items = state.items;
+      for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        it.x = (it.x + it.dx * deltaDays + w) % w;
+        it.y = (it.y + it.dy * deltaDays + h) % h;
+        it.r = Math.max(6, Math.min(50, it.r + it.dr * deltaDays));
+      }
+
+      // Redraw current field
+      ctx.clearRect(0, 0, w, h);
+      for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        const g = ctx.createRadialGradient(it.x, it.y, 0, it.x, it.y, it.r);
+        g.addColorStop(0, `rgba(255,255,255,${it.a.toFixed(3)})`);
         g.addColorStop(1, 'rgba(255,255,255,0)');
         ctx.fillStyle = g;
-        ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI*2); ctx.fill();
+        ctx.beginPath(); ctx.arc(it.x, it.y, it.r, 0, Math.PI * 2); ctx.fill();
       }
       return canvas;
     }
@@ -765,7 +813,8 @@
       canvas.width = w; canvas.height = h;
       const ctx = canvas.getContext('2d');
 
-      // Water coverage tints toward blue
+      // Water coverage: draw true oceans using a stable mask
+      // Helper to mix two hex colors
       const mix = (a, b, t) => {
         const ah = parseInt(a.slice(1), 16), bh = parseInt(b.slice(1), 16);
         const ar = (ah >> 16) & 255, ag = (ah >> 8) & 255, ab = ah & 255;
@@ -776,8 +825,9 @@
         return `rgb(${r},${g},${b2})`;
       };
       const waterT = (this.viz.coverage?.water || 0) / 100;
-      const topCol = mix('#8a2a2a', '#2a4d8a', waterT);
-      const botCol = mix('#6e1f1f', '#1f3a6e', waterT);
+      // Base terrain stays dry colors; oceans will be overlaid above
+      const topCol = '#8a2a2a';
+      const botCol = '#6e1f1f';
       const base = ctx.createLinearGradient(0, 0, 0, h);
       base.addColorStop(0, topCol);
       base.addColorStop(1, botCol);
@@ -789,6 +839,35 @@
         ctx.drawImage(this.craterLayer, 0, 0);
         ctx.globalAlpha = 1;
       }
+
+      // ----- Oceans overlay (above terrain/craters) -----
+      if (!this.waterMask) {
+        this.waterMask = this.generateWaterMask(w, h);
+      }
+      // Threshold so that waterT=0 -> no oceans, 1 -> nearly full coverage
+      const thr = waterT; // noise < thr = ocean (0% -> no ocean, 100% -> full ocean)
+      const coastWidth = 0.01; // sharper coastline transition
+      const ocean = document.createElement('canvas');
+      ocean.width = w; ocean.height = h;
+      const octx = ocean.getContext('2d');
+      const img = octx.createImageData(w, h);
+      const data = img.data;
+      for (let i = 0; i < w * h; i++) {
+        const v = this.waterMask[i];
+        // smoothstep inverse: ocean where v below threshold
+        let a = 1 - ((v - thr + coastWidth) / (2 * coastWidth));
+        a = Math.max(0, Math.min(1, a));
+        const idx = i * 4;
+        // Deep ocean blue
+        // Deep ocean blue
+        const r = 10, g = 40, b = 120;
+        data[idx] = r;
+        data[idx + 1] = g;
+        data[idx + 2] = b;
+        data[idx + 3] = Math.floor(a * 255);
+      }
+      octx.putImageData(img, 0, 0);
+      ctx.drawImage(ocean, 0, 0);
 
       // Green cloud layer scales with life coverage
       const lifeT = (this.viz.coverage?.life || 0) / 100;
@@ -820,6 +899,44 @@
       texture.wrapT = THREE.ClampToEdgeWrapping;
       texture.needsUpdate = true;
       return texture;
+    }
+
+    // Build a stable FBM-based water mask (0..1) once per planet
+    generateWaterMask(w, h) {
+      const seed = this.hashSeedFromPlanet();
+      let s = Math.floor((seed.x * 65535) ^ (seed.y * 131071)) >>> 0;
+      const rand = () => { s = (1664525 * s + 1013904223) >>> 0; return (s & 0xffffffff) / 0x100000000; };
+      const hash = (x, y) => {
+        const n = Math.sin(x * 127.1 + y * 311.7 + s * 0.0001) * 43758.5453;
+        return n - Math.floor(n);
+      };
+      const noise2 = (x, y) => {
+        const xi = Math.floor(x), yi = Math.floor(y);
+        const xf = x - xi, yf = y - yi;
+        const u = xf * xf * (3 - 2 * xf);
+        const v = yf * yf * (3 - 2 * yf);
+        const a = hash(xi, yi), b = hash(xi + 1, yi);
+        const c = hash(xi, yi + 1), d = hash(xi + 1, yi + 1);
+        return (a * (1 - u) + b * u) * (1 - v) + (c * (1 - u) + d * u) * v;
+      };
+      const fbm = (x, y) => {
+        let f = 0, amp = 0.5, freq = 1.0;
+        for (let o = 0; o < 5; o++) { f += amp * noise2(x * freq, y * freq); freq *= 2; amp *= 0.5; }
+        return f;
+      };
+      const scale = 3.0; // controls size of continents
+      const arr = new Float32Array(w * h);
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const nx = (x / w) * scale;
+          const ny = (y / h) * (scale * 0.5);
+          let v = fbm(nx, ny);
+          // Bias to produce meaningful land/ocean separation
+          v = Math.min(1, Math.max(0, v));
+          arr[y * w + x] = v;
+        }
+      }
+      return arr;
     }
   }
 
